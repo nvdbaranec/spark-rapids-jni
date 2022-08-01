@@ -140,6 +140,8 @@ set(CUDFJNI_INCLUDE_DIRS
 
 add_library(
   spark_rapids_jni SHARED
+  src/castStringJni.cpp
+  src/cast_string.cu
   src/RowConversionJni.cpp
   src/NativeParquetJni.cpp
   src/row_conversion.cu
