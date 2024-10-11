@@ -21,7 +21,7 @@
 
   <groupId>com.nvidia</groupId>
   <artifactId>spark-rapids-jni</artifactId>
-  <version>24.08.0-SNAPSHOT</version>
+  <version>24.12.0-SNAPSHOT</version>
   <packaging>jar</packaging>
   <name>RAPIDS Accelerator JNI for Apache Spark</name>
   <description>
@@ -110,6 +110,7 @@
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <slf4j.version>1.7.30</slf4j.version>
     <submodule.check.skip>false</submodule.check.skip>
+    <submodule.patch.skip>false</submodule.patch.skip>
     <antrun.version>3.0.0</antrun.version>
     <hilbert.version>0.2.2</hilbert.version>
   </properties>
@@ -393,6 +394,38 @@
             </goals>
           </execution>
           <execution>
+            <id>cudf patch</id>
+            <phase>validate</phase>
+            <configuration>
+              <skip>${submodule.patch.skip}</skip>
+              <target>
+                <exec dir="${project.basedir}"
+                      failonerror="true"
+                      executable="${project.basedir}/build/apply-patches">
+                </exec>
+              </target>
+            </configuration>
+            <goals>
+              <goal>run</goal>
+            </goals>
+          </execution>
+          <execution>
+            <id>cudf un-patch</id>
+            <phase>clean</phase>
+            <configuration>
+              <skip>${submodule.patch.skip}</skip>
+              <target>
+                <exec dir="${project.basedir}"
+                      failonerror="true"
+                      executable="${project.basedir}/build/unapply-patches">
+                </exec>
+              </target>
+            </configuration>
+            <goals>
+              <goal>run</goal>
+            </goals>
+          </execution>
+          <execution>
             <id>build-libcudf</id>
             <phase>validate</phase>
             <configuration>
@@ -425,6 +458,7 @@
                   <arg value="-DCUDF_USE_ARROW_STATIC=ON"/>
                   <arg value="-DCUDF_USE_PER_THREAD_DEFAULT_STREAM=${CUDF_USE_PER_THREAD_DEFAULT_STREAM}" />
                   <arg value="-DCUDF_LARGE_STRINGS_DISABLED=ON"/>
+                  <arg value="-DKvikIO_REMOTE_SUPPORT=OFF"/>
                   <arg value="-DLIBCUDF_LOGGING_LEVEL=${RMM_LOGGING_LEVEL}" />
                   <arg value="-DRMM_LOGGING_LEVEL=${RMM_LOGGING_LEVEL}" />
                   <arg value="-DUSE_GDS=${USE_GDS}" />
