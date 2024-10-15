@@ -2267,7 +2267,10 @@ struct contiguous_split_state {
   std::pair<shuffle_split_result, shuffle_split_metadata> contiguous_split()
   {
     CUDF_EXPECTS(user_buffer_size == 0, "Cannot contiguous split with a user buffer");
-    if (is_empty || input.num_columns() == 0) { return {}; }
+    if (is_empty || input.num_columns() == 0) { 
+      return {shuffle_split_result{std::make_unique<rmm::device_buffer>(std::move(out_buffer)), std::move(out_buffer_offsets)},
+              shuffle_split_metadata{std::move(metadata.global_metadata.col_info)}};
+    }
 
     auto const num_batches_total =
       std::get<1>(chunk_iter_state->get_current_starting_index_and_buff_count());
@@ -2364,13 +2367,12 @@ struct contiguous_split_state {
       num_src_bufs{count_src_bufs(input.begin(), input.end())},
       num_bufs{num_src_bufs * num_partitions}
   {
-    // if the table we are about to contig split is empty, we have special
-    // handling where metadata is produced and a 0-byte contiguous buffer
-    // is the result.
-    if (is_empty) { return; }
-
-    // compute metadata
+    // compute metadata, even if the input is empty.
     metadata = compute_metadata(input);
+
+    // if the table we are about to contig split is empty, no additional
+    // work is necessary.
+    if (is_empty) { return; }
 
     // debug
     stream.synchronize();
@@ -3322,7 +3324,7 @@ std::pair<std::vector<rmm::device_buffer>, rmm::device_uvector<assemble_batch>> 
                                            src_offset + batch_offset,
                                            dst_offset + batch_offset,
                                            bytes);
-                                           */
+                                          */
 
                                          return assemble_batch {
                                           partitions + src_offset + batch_offset,
