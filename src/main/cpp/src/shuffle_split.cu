@@ -1333,20 +1333,32 @@ template <typename InputIter>
 void populate_column_data(cz_metadata_internal& meta, InputIter begin, InputIter end)
 {
   std::for_each(begin, end, [&meta](column_view const& col){
-    // - strings need to store 2 row counts (the string column row count and the number of chars)
-    // - all others only need 1 row count
-    meta.per_partition_metadata_size += col.type().id() == cudf::type_id::STRING ? 8 : 4;
+    // strings need to store an additional char count
+    meta.per_partition_metadata_size += col.type().id() == cudf::type_id::STRING ? 4 : 0;
 
-    if(col.type().id() == cudf::type_id::STRUCT){
-      meta.global_metadata.col_info.push_back({col.num_children(), col.type().id()});
+    switch(col.type().id()){
+    case cudf::type_id::STRUCT:
+      meta.global_metadata.col_info.push_back({col.type().id(), col.num_children()});
       populate_column_data(meta, col.child_begin(), col.child_end());
-    } else if(col.type().id() == cudf::type_id::LIST){
-      meta.global_metadata.col_info.push_back({1, col.type().id()});
+      break;
+    
+    case cudf::type_id::LIST: {
+      meta.global_metadata.col_info.push_back({col.type().id(), 1});
       cudf::lists_column_view lcv(col);
       std::vector<cudf::column_view> children({lcv.child()});
       populate_column_data(meta, children.begin(), children.end());
-    } else {
-      meta.global_metadata.col_info.push_back({0, col.type().id()});
+      } break;
+
+    case cudf::type_id::DECIMAL32:
+    case cudf::type_id::DECIMAL64:
+    case cudf::type_id::DECIMAL128:
+      // TODO: scale.
+      meta.global_metadata.col_info.push_back({col.type().id(), 0});
+      break;
+
+    default:
+      meta.global_metadata.col_info.push_back({col.type().id(), 0});
+      break;
     }
   });
 }
@@ -1361,6 +1373,8 @@ cz_metadata_internal compute_metadata(cudf::table_view const& input)
   cz_metadata_internal ret;
   ret.num_columns = input.num_columns();
   ret.global_metadata.col_info.reserve(num_internal_columns);
+  // 4 byte row count
+  ret.per_partition_metadata_size += 4;
   // 1 bit indicating presence of null vector, per internal column
   ret.per_partition_metadata_size += (cudf::util::round_up_safe(num_internal_columns, 32) / 32) * sizeof(bitmask_type);
   populate_column_data(ret, input.begin(), input.end());
@@ -2022,27 +2036,6 @@ bool check_inputs(cudf::table_view const& input, std::vector<size_type> const& s
   return input.column(0).size() == 0;
 }
 
-//         buf_count                   num_row_count
-// lists:  (validity, offsets),        (num_rows)
-// string: (validity, chars, offsets), (num_rows, num_rows in the chars buffer)
-// struct: (validity, unused),         (num_rows)
-// other:  (validity, data),           (num_rows)
-//
-// this represents the number of buffers we will be working with when assembling the
-// output data (the assemble_info structs). some of them may end up being unused (for example,
-// not every column is going to have a validity buffer). we're doing this assuming the worst case
-// to keep the setup code simpler.
-/*
-constexpr size_type type_to_column_buf_count(cudf::type_id type)
-{
-  return type == cudf::type_id::STRING ? 3 : 2;
-}
-*/
-constexpr size_type type_to_column_num_row_counts(cudf::type_id type)
-{
-  return type == cudf::type_id::STRING ? 2 : 1;
-}
-
 __global__ void pack_per_partition_data_kernel(uint8_t* out_buffer,
                                                size_type num_partitions,
                                                size_t columns_per_partition,
@@ -2051,7 +2044,7 @@ __global__ void pack_per_partition_data_kernel(uint8_t* out_buffer,
                                                size_type bufs_per_partition,
                                                size_type const* metadata_col_to_buf_index,
                                                size_t const* out_buffer_offsets,
-                                               size_type const *row_count_offsets,
+                                               size_type const *char_count_offsets,
                                                shuffle_split_col_data const* col_data)
 
 {
@@ -2060,35 +2053,39 @@ __global__ void pack_per_partition_data_kernel(uint8_t* out_buffer,
   auto const partition_index = tid / threads_per_partition;
   if(partition_index >= num_partitions){
     return;
-  }
-  auto const col_index = tid % threads_per_partition;  
+  }  
+  auto const col_index = tid % threads_per_partition;
 
-  // start of the metadata buffer for this partition  
+  // start of the metadata buffer for this partition
   uint8_t* buf_start = out_buffer + out_buffer_offsets[partition_index];
 
-  // store row count
-  if(col_index < columns_per_partition){
+  // first thread in each partition stores the partition-level row count
+  if(col_index == 0){
+    size_type partition_num_rows = 0;
+    // it is possible to get in here with no columns -or- no rows.
+    if(col_index < columns_per_partition){
+      auto const src_buf_index = metadata_col_to_buf_index[col_index];
+      auto const dst_buf_index = (partition_index * bufs_per_partition) + src_buf_index;
+      partition_num_rows = col_data[col_index].type == cudf::type_id::STRING ? dst_buf_info[dst_buf_index].root_num_rows : dst_buf_info[dst_buf_index].num_rows;
+    }
+    reinterpret_cast<size_type*>(buf_start)[0] = partition_num_rows;
+  }  
+
+  // store char count for strings
+  if(col_index < columns_per_partition && col_data[col_index].type == cudf::type_id::STRING){
     auto const src_buf_index = metadata_col_to_buf_index[col_index];
     auto const dst_buf_index = (partition_index * bufs_per_partition) + src_buf_index;
 
-    // start of row counts for this column
-    size_type* row_count = reinterpret_cast<size_type*>(buf_start + (row_count_offsets[col_index] * sizeof(size_type)));
-    if(col_data[col_index].type == cudf::type_id::STRING){
-      row_count[0] = dst_buf_info[dst_buf_index].root_num_rows; // # of strings
-      row_count[1] = dst_buf_info[dst_buf_index].num_rows;      // # of chars
-    } else {
-      // all other columns write out just 1 row count. everything else can be reconstructed from there 
-      // on the assemble side (eg offsets)
-      // printf("Pack: partition_index = %d (%d), dst_buf_index = %d(%lu), num_rows = %d, col_index = %d, tid = %d\n", (int)partition_index, (int)out_buffer_offsets[partition_index], (int)dst_buf_index, (uint64_t)(row_count), dst_buf_info[dst_buf_index].num_rows, (int)col_index, (int)tid);
-      row_count[0] = dst_buf_info[dst_buf_index].num_rows;
-    }
+    // char count for this column
+    size_type* char_count = reinterpret_cast<size_type*>(buf_start + (char_count_offsets[col_index] * sizeof(size_type)) + 4);
+    char_count[0] = dst_buf_info[dst_buf_index].num_rows;      // # of chars
   }  
 
   // store has-validity bits
   bitmask_type mask = __ballot_sync(0xffffffff, col_index < columns_per_partition ? src_buf_info[metadata_col_to_buf_index[col_index]].is_validity : 0);
   if((col_index % cudf::detail::warp_size == 0) && col_index < columns_per_partition){
-    auto const num_row_counts = row_count_offsets[columns_per_partition];
-    bitmask_type* has_validity = reinterpret_cast<bitmask_type*>(buf_start + (num_row_counts * sizeof(size_type)));
+    auto const num_char_counts = char_count_offsets[columns_per_partition];
+    bitmask_type* has_validity = reinterpret_cast<bitmask_type*>(buf_start + (num_char_counts * sizeof(size_type)) + 4);
     // printf("HV: %d : %d, %d, %d\n", (int)(col_index / cudf::detail::warp_size), (int)mask, (int)col_index, (int)tid);
     has_validity[col_index / cudf::detail::warp_size] = mask;
   }
@@ -2117,17 +2114,17 @@ void pack_per_partition_data(cz_metadata_internal const& metadata,
 
   auto const metadata_size = metadata.global_metadata.col_info.size();
 
-  // compute offset for each set of row counts in the output buffers
+  // compute offset for each char count for each string column in the input
   rmm::device_uvector<shuffle_split_col_data> d_col_data = cudf::detail::make_device_uvector_async(metadata.global_metadata.col_info, stream, temp_mr);
-  rmm::device_uvector<size_type> row_count_offsets(metadata_size + 1, stream, temp_mr);
-  auto row_count_iter = cudf::detail::make_counting_transform_iterator(0, cuda::proclaim_return_type<size_type>([d_col_data = d_col_data.begin(), num_types = d_col_data.size()] __device__ (size_type i) -> size_type {
-    return i >= num_types ? 0 : type_to_column_num_row_counts(d_col_data[i].type);
+  rmm::device_uvector<size_type> char_count_offsets(metadata_size + 1, stream, temp_mr);
+  auto char_count_iter = cudf::detail::make_counting_transform_iterator(0, cuda::proclaim_return_type<size_type>([d_col_data = d_col_data.begin(), num_cols = d_col_data.size()] __device__ (size_type i) -> size_type {
+    return i >= num_cols ? 0 : (d_col_data[i].type == cudf::type_id::STRING ? 1 : 0);
   }));
   thrust::exclusive_scan(rmm::exec_policy_nosync(stream, temp_mr),
-                         row_count_iter,
-                         row_count_iter + metadata_size + 1,
-                         row_count_offsets.begin());
-  // print_vector(row_count_offsets);  
+                         char_count_iter,
+                         char_count_iter + metadata_size + 1,
+                         char_count_offsets.begin());
+  // print_vector(char_count_offsets);
   
   // pack the row counts and validity info
   auto const num_partitions = out_buffer_offsets.size();
@@ -2144,7 +2141,7 @@ void pack_per_partition_data(cz_metadata_internal const& metadata,
                                                                                                      bufs_per_partition,
                                                                                                      d_metadata_col_to_buf_index,
                                                                                                      out_buffer_offsets.begin(),
-                                                                                                     row_count_offsets.begin(),
+                                                                                                     char_count_offsets.begin(),
                                                                                                      d_col_data.begin());
 
   /*
@@ -2953,24 +2950,24 @@ assemble_build_column_info(shuffle_split_metadata const& h_global_metadata,
   rmm::device_uvector<assemble_column_info> column_info(num_columns, stream, temp_mr);  
 
   // compute:
-  //  - index into the row count buffer in the metadata
-  //  - total per-partition row_count
-  rmm::device_uvector<size_type> row_count_indices(num_columns + 1, stream, temp_mr);
-  auto rc_index_iter = cudf::detail::make_counting_transform_iterator(0, cuda::proclaim_return_type<size_type>([global_metadata = global_metadata.begin(), num_columns] __device__ (size_type i) {
-    auto const column_type = global_metadata[i].type;
-    return i >= num_columns ? 0 : type_to_column_num_row_counts(column_type);
+  //  - indices into the char count data for string columns
+  //  - offset into the partition data where has-validity begins
+  rmm::device_uvector<size_type> char_count_indices(num_columns + 1, stream, temp_mr);
+  auto cc_index_iter = cudf::detail::make_counting_transform_iterator(0, cuda::proclaim_return_type<size_type>([global_metadata = global_metadata.begin(), num_columns] __device__ (size_type i) {
+    return i >= num_columns ? 0 : (global_metadata[i].type == cudf::type_id::STRING ? 1 : 0);
   }));
-  thrust::exclusive_scan(rmm::exec_policy_nosync(stream, temp_mr), rc_index_iter, rc_index_iter + num_columns + 1, row_count_indices.begin());
-  size_type per_partition_num_row_counts = row_count_indices.back_element(stream);
-  auto const has_validity_offset = per_partition_num_row_counts * sizeof(size_type);
-  
+  thrust::exclusive_scan(rmm::exec_policy_nosync(stream, temp_mr), cc_index_iter, cc_index_iter + num_columns + 1, char_count_indices.begin());
+  size_type const per_partition_num_char_counts = char_count_indices.back_element(stream);
+  // the +1 is for the per-partition overall row count at the very beginning
+  auto const has_validity_offset = (per_partition_num_char_counts + 1) * sizeof(size_type);
+    
   /*
   {
-    auto h_row_count_indices = cudf::detail::make_std_vector_sync(row_count_indices, stream);
-    printf("per_partition_num_row_counts : %d\n", per_partition_num_row_counts);
+    auto h_char_count_indices = cudf::detail::make_std_vector_sync(char_count_indices, stream);
+    printf("per_partition_num_char_counts : %d\n", per_partition_num_char_counts);
     printf("has_validity_offset : %lu\n", has_validity_offset);
-    for(size_t idx=0; idx<h_row_count_indices.size(); idx++){
-      printf("h_row_count_indices(%lu): %d\n", idx, h_row_count_indices[idx]);
+    for(size_t idx=0; idx<h_char_count_indices.size(); idx++){
+      printf("h_char_count_indices(%lu): %d\n", idx, h_char_count_indices[idx]);
     }
   }
   */
@@ -2986,7 +2983,7 @@ assemble_build_column_info(shuffle_split_metadata const& h_global_metadata,
                                       partitions = partitions.data(),
                                       partition_offsets = partition_offsets.begin()]
                                       __device__ (int i) -> bool {
-      auto const partition_index = i % num_partitions;      
+      auto const partition_index = i % num_partitions;
       bitmask_type const*const has_validity_buf = reinterpret_cast<bitmask_type const*>(partitions + partition_offsets[partition_index] + has_validity_offset);
       auto const col_index = i / num_partitions;
       // printf("HVV: %d, %d, %d, %d, %d\n", (int)partition_index, (int)partition_offsets[partition_index], (int)has_validity_offset, (int)col_index, (int)has_validity_buf[col_index / 32]);
@@ -2995,13 +2992,13 @@ assemble_build_column_info(shuffle_split_metadata const& h_global_metadata,
   );
   thrust::reduce_by_key(rmm::exec_policy_nosync(stream, temp_mr),
                         column_keys,
-                        column_keys +  num_column_instances,
+                        column_keys + num_column_instances,
                         has_validity_values,
                         thrust::make_discard_iterator(),
                         assemble_column_info_has_validity_output_iter{column_info.begin()},
                         thrust::equal_to<size_type>{},
                         thrust::logical_or<bool>{});
-  
+    
   /*
   {
     auto h_column_info = cudf::detail::make_std_vector_sync(column_info, stream);
@@ -3012,51 +3009,73 @@ assemble_build_column_info(shuffle_split_metadata const& h_global_metadata,
   */
 
   // print_span(cudf::device_span<size_t const>(partition_offsets));
-  
-  // compute row counts
-  // note that we are iterating vertically -> horizontally here, with each column's individual piece per partition first.
-  // TODO: use an output iterator and write directly to the outgoing assembly_info structs
-  auto rc_keys = cudf::detail::make_counting_transform_iterator(0, cuda::proclaim_return_type<cudf::size_type>([num_partitions] __device__ (int i){
-    return i / num_partitions;
-  }));
+
+  // compute overall row count
   auto row_count_values = cudf::detail::make_counting_transform_iterator(0,
     cuda::proclaim_return_type<cudf::size_type>([num_partitions,
                                                  partitions = partitions.data(),
                                                  partition_offsets = partition_offsets.begin()]
                                                  __device__ (int i){
+                                                  return reinterpret_cast<size_type const*>(partitions + partition_offsets[i])[0];
+                                                 }));
+  size_t const row_count =  thrust::reduce(rmm::exec_policy_nosync(stream, temp_mr),
+                                            row_count_values,
+                                            row_count_values + num_partitions);
+  
+  // compute char counts for strings
+  // note that we are iterating vertically -> horizontally here, with each column's individual piece per partition first.
+  // TODO: use an output iterator and write directly to the outgoing assembly_info structs
+  auto cc_keys = cudf::detail::make_counting_transform_iterator(0, cuda::proclaim_return_type<cudf::size_type>([num_partitions] __device__ (int i){
+    return i / num_partitions;
+  }));
+  auto char_count_values = cudf::detail::make_counting_transform_iterator(0,
+    cuda::proclaim_return_type<cudf::size_type>([num_partitions,
+                                                 partitions = partitions.data(),
+                                                 partition_offsets = partition_offsets.begin(),
+                                                 global_metadata = global_metadata.begin(),
+                                                 char_count_indices = char_count_indices.begin()]
+                                                 __device__ (int i){
       auto const partition_index = i % num_partitions;
-      size_type const*const row_counts = reinterpret_cast<size_type const*>(partitions + partition_offsets[partition_index]);
-      auto const rc_index = i / num_partitions;
-      // printf("RCI %d : %d, partition_index = %d\n", (int)rc_index, row_counts[rc_index], (int)partition_index);
-      return row_counts[rc_index];
+      auto const col_index = i / num_partitions;
+
+      // non-string columns don't have a char count
+      auto const column_type = global_metadata[col_index].type;
+      if(column_type != cudf::type_id::STRING){
+        return 0;
+      }
+      
+      size_type const*const char_counts = reinterpret_cast<size_type const*>(partitions + partition_offsets[partition_index] + 4);
+      // printf("RCI %d : %d, partition_index = %d\n", (int)col_index, char_counts[col_index], (int)partition_index);
+      return char_counts[char_count_indices[col_index]];
     })
   );
-  rmm::device_uvector<size_type> row_counts(per_partition_num_row_counts, stream, temp_mr);
+  rmm::device_uvector<size_type> char_counts(num_columns, stream, temp_mr);
   thrust::reduce_by_key(rmm::exec_policy_nosync(stream, temp_mr),
-                        rc_keys, 
-                        rc_keys + (per_partition_num_row_counts * num_partitions),
-                        row_count_values,
+                        cc_keys, 
+                        cc_keys + num_column_instances,
+                        char_count_values,
                         thrust::make_discard_iterator(),
-                        row_counts.begin());
-  // print_span(static_cast<cudf::device_span<size_type const>>(row_counts));
+                        char_counts.begin());
+  // print_span(static_cast<cudf::device_span<size_type const>>(char_counts));
   
   // copy type and summed row counts
   auto iter = thrust::make_counting_iterator(0);
-  thrust::for_each(rmm::exec_policy_nosync(stream, temp_mr), iter, iter + num_columns, [row_count_indices = row_count_indices.begin(),
+  thrust::for_each(rmm::exec_policy_nosync(stream, temp_mr), iter, iter + num_columns, [row_count,
                                                                                         column_info = column_info.begin(),
                                                                                         global_metadata = global_metadata.begin(),
-                                                                                        row_counts = row_counts.begin()]
+                                                                                        char_count_indices = char_count_indices.begin(),
+                                                                                        char_counts = char_counts.begin()]
                                                                                         __device__ (size_type i){
     auto const& metadata = global_metadata[i];
     auto& cinfo = column_info[i];
     
     cinfo.type = metadata.type;
     cinfo.null_count = 0; // TODO
-
-    auto const row_count_index = row_count_indices[i];
-    cinfo.num_rows = row_counts[row_count_index];
-    // string columns store the row count for the chars as well
-    cinfo.num_chars = cinfo.type == cudf::type_id::STRING ? row_counts[row_count_index + 1] : 0;
+    
+    cinfo.num_rows = row_count;
+    
+    // string columns store the char count separately
+    cinfo.num_chars = cinfo.type == cudf::type_id::STRING ? char_counts[char_count_indices[i]] : 0;
   });
   
   /*
@@ -3073,7 +3092,7 @@ assemble_build_column_info(shuffle_split_metadata const& h_global_metadata,
 
   // has-validity, type, row count
   rmm::device_uvector<assemble_column_info> column_instance_info(num_column_instances, stream, temp_mr);
-  thrust::for_each(rmm::exec_policy_nosync(stream, temp_mr), iter, iter + num_column_instances, [row_count_indices = row_count_indices.begin(),
+  thrust::for_each(rmm::exec_policy_nosync(stream, temp_mr), iter, iter + num_column_instances, [char_count_indices = char_count_indices.begin(),
                                                                                                  column_instance_info = column_instance_info.begin(),
                                                                                                  global_metadata = global_metadata.begin(),
                                                                                                  partitions = partitions.data(),
@@ -3095,15 +3114,13 @@ assemble_build_column_info(shuffle_split_metadata const& h_global_metadata,
     
     cinstance_info.type = metadata.type;
     cinstance_info.null_count = 0; // TODO
-
-    auto const row_count_index = row_count_indices[col_index];
-    size_type const*const row_counts = reinterpret_cast<size_type const*>(pheader);
-    cinstance_info.num_rows = row_counts[row_count_index];
-    // string columns store the row count for the chars as well
+    
+    cinstance_info.num_rows = reinterpret_cast<size_type const*>(pheader)[0];
+    
+    // string columns store the char count separately
     if(metadata.type == cudf::type_id::STRING){
-      cinstance_info.num_chars = row_counts[row_count_index + 1];
-    } else {
-      cinstance_info.num_chars = 0;
+      size_type const*const char_counts = reinterpret_cast<size_type const*>(pheader + 4);
+      cinstance_info.num_chars = char_counts[char_count_indices[col_index]];
     }
   });
 
@@ -3123,7 +3140,7 @@ assemble_build_column_info(shuffle_split_metadata const& h_global_metadata,
   */
 
   // compute per-partition metadata size
-  size_t const metadata_rc_size = (per_partition_num_row_counts * sizeof(size_type));
+  size_t const metadata_rc_size = ((per_partition_num_char_counts + 1) * sizeof(size_type));
   size_t const metadata_has_validity_size = (cudf::util::round_up_safe(num_columns, size_t{32}) / size_t{32}) * sizeof(bitmask_type);
   size_t const per_partition_metadata_size = cudf::util::round_up_safe(metadata_rc_size + metadata_has_validity_size, shuffle_split_partition_data_align);
 
