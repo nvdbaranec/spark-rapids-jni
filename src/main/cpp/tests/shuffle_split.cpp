@@ -97,3 +97,36 @@ TEST_F(ShuffleSplitTests, EmptyInputs)
                           static_cast<cudf::column_view>(col3)}};
   run_split(tbl, {});
 }
+
+/*
+TEST_F(ShuffleSplitTests, Struct)
+{  
+  cudf::size_type const num_rows = 10000;
+  auto iter = thrust::make_counting_iterator(0);
+  cudf::test::fixed_width_column_wrapper<int> col0(iter, iter + num_rows);
+  
+  cudf::test::fixed_width_column_wrapper<float> child0(iter, iter + num_rows);
+  cudf::test::fixed_width_column_wrapper<int16_t> child1(iter, iter + num_rows);
+  cudf::test::fixed_width_column_wrapper<int8_t> child2(iter, iter + num_rows);
+  std::vector<std::unique_ptr<cudf::column>> struct_children;
+  struct_children.push_back(child0.release());
+  struct_children.push_back(child1.release());
+  struct_children.push_back(child2.release());
+  cudf::test::structs_column_wrapper col1(std::move(struct_children));
+
+
+  // 4 columns split once
+  {
+    cudf::table_view tbl{{static_cast<cudf::column_view>(col0),
+                          static_cast<cudf::column_view>(col1)}};
+    run_split(tbl, {10});
+  }
+
+  // 4 columns split multiple times
+  {
+    cudf::table_view tbl{{static_cast<cudf::column_view>(col0),
+                          static_cast<cudf::column_view>(col1)}};
+    run_split(tbl, {10, 100, 2756, 7777});
+  }
+}
+*/
