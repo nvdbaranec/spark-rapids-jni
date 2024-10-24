@@ -1,3 +1,4 @@
+
 /*
  * Copyright (c) 2024, NVIDIA CORPORATION.
  *
@@ -2597,10 +2598,7 @@ std::pair<shuffle_split_result, shuffle_split_metadata> shuffle_split(cudf::tabl
 {
   // for now, we don't allow strings, lists or columns with validity
   CUDF_EXPECTS(std::all_of(input.begin(), input.end(), [](cudf::column_view const& col){
-    return col.type().id() != cudf::type_id::STRING && 
-           col.type().id() != cudf::type_id::LIST &&
-           !col.nullable();
-  }), "Unsupported column type (for now)");
+    return col.type().id() != cudf::type_id::STRING && col.type().id() != cudf::type_id::LIST; }), "Unsupported column type (for now)");
 
   // `temp_mr` is the same as `mr` for contiguous_split as it allocates all
   // of its memory from the default memory resource in cuDF
@@ -2655,10 +2653,10 @@ struct assemble_batch {
 
   int8_t const* src;
   int8_t* dst;
-  size_t              size;
+  size_t              size;     // bytes
   bool                validity; // whether or not this is a validity buffer
   int value_shift;              // amount to shift values down by (for offset buffers)
-  int bit_shift;                // # of bits to shift right by (for validity buffers)
+  int bit_shift;                // # of bits to shift left by (for validity buffers)
   size_type valid_count = 0;    // (output) validity count for this block of work
 };
 
@@ -2827,13 +2825,10 @@ private:
 };
 
 // Computes required allocation size of a bitmask
-__device__ std::size_t device_bitmask_allocation_size_bytes(size_type number_of_bits, std::size_t padding_boundary)
+__device__ std::size_t device_bitmask_allocation_size_bytes(size_type number_of_bits)
 {
-  auto necessary_bytes = cudf::util::div_rounding_up_safe<size_type>(number_of_bits, CHAR_BIT);
-
-  auto padded_bytes = padding_boundary * cudf::util::div_rounding_up_safe<size_type>(
-                                           necessary_bytes, padding_boundary);
-  return padded_bytes;
+  auto const necessary_words = cudf::util::div_rounding_up_safe<size_type>(number_of_bits, 32);
+  return necessary_words * sizeof(bitmask_type);
 }
 
 // Important: this returns the size of the buffer -without- padding. just the size of
@@ -2844,7 +2839,7 @@ struct assemble_buffer_size_functor {
   {
     // validity
     if(col.has_validity){
-      *out++ = device_bitmask_allocation_size_bytes(col.num_rows, 1);
+      *out++ = device_bitmask_allocation_size_bytes(col.num_rows);
     }
 
     // data
@@ -2856,7 +2851,7 @@ struct assemble_buffer_size_functor {
   { 
     // validity
     if(col.has_validity){
-      *out++ = device_bitmask_allocation_size_bytes(col.num_rows, 1);
+      *out++ = device_bitmask_allocation_size_bytes(col.num_rows);
     }
 
     // offsets
@@ -2868,7 +2863,7 @@ struct assemble_buffer_size_functor {
   { 
     // validity
     if(col.has_validity){
-      *out++ = device_bitmask_allocation_size_bytes(col.num_rows, 1);
+      *out++ = device_bitmask_allocation_size_bytes(col.num_rows);
     }
   }
 
@@ -2877,7 +2872,7 @@ struct assemble_buffer_size_functor {
   { 
     // validity
     if(col.has_validity){
-      *out++ = device_bitmask_allocation_size_bytes(col.num_rows, 1);
+      *out++ = device_bitmask_allocation_size_bytes(col.num_rows);
     }
 
     // chars
@@ -3004,8 +2999,8 @@ assemble_build_column_info(shuffle_split_metadata const& h_global_metadata,
   size_type const per_partition_num_char_counts = char_count_indices.back_element(stream);
   // the +1 is for the per-partition overall row count at the very beginning
   auto const has_validity_offset = (per_partition_num_char_counts + 1) * sizeof(size_type);
-
-  /*  
+  
+  /*
   {
     auto h_char_count_indices = cudf::detail::make_std_vector_sync(char_count_indices, stream);
     printf("per_partition_num_char_counts : %d\n", per_partition_num_char_counts);
@@ -3014,7 +3009,7 @@ assemble_build_column_info(shuffle_split_metadata const& h_global_metadata,
       printf("h_char_count_indices(%lu): %d\n", idx, h_char_count_indices[idx]);
     }
   } 
-  */ 
+  */
 
   // compute has-validity
   // note that we are iterating vertically -> horizontally here, with each column's individual piece per partition first.
@@ -3041,17 +3036,17 @@ assemble_build_column_info(shuffle_split_metadata const& h_global_metadata,
                         thrust::make_discard_iterator(),
                         assemble_column_info_has_validity_output_iter{column_info.begin()},
                         thrust::equal_to<size_type>{},
-                        thrust::logical_or<bool>{});
+                        thrust::logical_or<bool>{});  
   /*
   {
     auto h_column_info = cudf::detail::make_std_vector_sync(column_info, stream);
     for(size_t idx=0; idx<h_column_info.size(); idx++){
       printf("h_column_info(%lu): has_validity = %d\n", idx, (int)(h_column_info[idx].has_validity ? 1 : 0));
     }
-  }
-  */
+  } 
+  */ 
 
-  //print_span(cudf::device_span<size_t const>(partition_offsets));
+  // print_span(cudf::device_span<size_t const>(partition_offsets));
 
   // compute overall row count
   auto row_count_values = cudf::detail::make_counting_transform_iterator(0,
@@ -3121,7 +3116,7 @@ assemble_build_column_info(shuffle_split_metadata const& h_global_metadata,
     // string columns store the char count separately
     cinfo.num_chars = cinfo.type == cudf::type_id::STRING ? char_counts[char_count_indices[col_index]] : 0;
   });
-  
+    
   /*
   {
     auto h_column_info = cudf::detail::make_std_vector_sync(column_info, stream);
@@ -3129,8 +3124,8 @@ assemble_build_column_info(shuffle_split_metadata const& h_global_metadata,
       printf("col_info[%lu]: type = %d has_validity = %d num_rows = %d num_chars = %d null_count = %d\n", idx,
         (int)h_column_info[idx].type, h_column_info[idx].has_validity ? 1 : 0, h_column_info[idx].num_rows, h_column_info[idx].num_chars, h_column_info[idx].null_count);
     }
-  } 
-  */ 
+  }
+  */
 
   // generate per-column-instance data ------------------------------------------------------
 
@@ -3168,7 +3163,7 @@ assemble_build_column_info(shuffle_split_metadata const& h_global_metadata,
       cinstance_info.num_chars = char_counts[char_count_indices[col_index]];
     }
   });
-  
+    
   /*
   {
     auto h_column_instance_info = cudf::detail::make_std_vector_sync(column_instance_info, stream);
@@ -3182,7 +3177,7 @@ assemble_build_column_info(shuffle_split_metadata const& h_global_metadata,
         (int)h_column_instance_info[idx].type, h_column_instance_info[idx].has_validity ? 1 : 0, h_column_instance_info[idx].num_rows, h_column_instance_info[idx].num_chars, h_column_instance_info[idx].null_count);
     }
   } 
-  */  
+  */
 
   // compute per-partition metadata size
   size_t const metadata_rc_size = ((per_partition_num_char_counts + 1) * sizeof(size_type));
@@ -3226,7 +3221,7 @@ rmm::device_uvector<std::invoke_result_t<GroupFunction>> transform_expand(SizeIt
                     }));
 
   return result;
-};
+}
 
 // returns destination buffers
 std::pair<std::vector<rmm::device_buffer>, rmm::device_uvector<assemble_batch>> assemble_build_buffers(rmm::device_uvector<assemble_column_info> const& column_info,
@@ -3251,7 +3246,6 @@ std::pair<std::vector<rmm::device_buffer>, rmm::device_uvector<assemble_batch>> 
                           detail::assemble_buffer_functor{stream, mr},
                           h_column_info[idx],
                           assemble_buffers);
-
   }
   std::vector<int8_t*> h_dst_buffers(assemble_buffers.size());
   std::transform(assemble_buffers.begin(), assemble_buffers.end(), h_dst_buffers.begin(), [](rmm::device_buffer& buf){
@@ -3267,11 +3261,14 @@ std::pair<std::vector<rmm::device_buffer>, rmm::device_uvector<assemble_batch>> 
   // - unpadded sizes of the source buffers
   // - offsets into the partition data where each source buffer starts
   // - offsets into the destination buffers where each source buffer starts writing
+  // - starting row indices for each partition
   size_t const buffers_per_partition = assemble_buffers.size();
   size_t const num_src_buffers = buffers_per_partition * num_partitions;
+  size_t const num_columns = column_info.size();
   rmm::device_uvector<size_t> src_sizes_unpadded(num_src_buffers, stream, mr);
   rmm::device_uvector<size_t> src_offsets(num_src_buffers, stream, mr);
   rmm::device_uvector<size_t> dst_offsets(num_src_buffers, stream, mr);
+  rmm::device_uvector<size_type> partition_row_indices(num_partitions, stream, temp_mr);
   {
     // generate unpadded sizes of the source buffers
     auto const num_column_instances = column_instance_info.size();
@@ -3280,7 +3277,7 @@ std::pair<std::vector<rmm::device_buffer>, rmm::device_uvector<assemble_batch>> 
                     iter,
                     iter + num_column_instances,
                     [buffers_per_partition,
-                     num_columns = column_info.size(),
+                     num_columns,
                      column_to_buffer_map = column_to_buffer_map.begin(),
                      column_instance_info = column_instance_info.begin(),
                      src_sizes_unpadded = src_sizes_unpadded.begin()] __device__ (size_type i){
@@ -3313,7 +3310,7 @@ std::pair<std::vector<rmm::device_buffer>, rmm::device_uvector<assemble_batch>> 
     thrust::for_each(rmm::exec_policy(stream, temp_mr),
                     iter,
                     iter + num_column_instances,
-                    [num_columns = column_info.size(),
+                    [num_columns,
                      buffers_per_partition,
                      column_to_buffer_map = column_to_buffer_map.begin(),
                      column_instance_info = column_instance_info.begin(),
@@ -3353,6 +3350,35 @@ std::pair<std::vector<rmm::device_buffer>, rmm::device_uvector<assemble_batch>> 
                                   size_iter,
                                   dst_offsets.begin());
     // print_span(cudf::device_span<size_t const>{dst_offsets});
+
+    // for validity, we need to do a little more work. our destination positions are defined by bit position,
+    // not byte position. so round down into the nearest starting bitmask word.    
+    auto row_count_iter = cudf::detail::make_counting_transform_iterator(0, cuda::proclaim_return_type<size_type>([column_instance_info = column_instance_info.begin(),
+                                                                                                     columns_per_partition = column_info.size()] __device__ (size_type i){
+      auto col = column_instance_info[i * columns_per_partition];
+      return col.num_rows;
+    }));
+    thrust::exclusive_scan(rmm::exec_policy(stream, temp_mr),
+                           row_count_iter,
+                           row_count_iter + num_partitions,
+                           partition_row_indices.begin());
+    thrust::for_each(rmm::exec_policy(stream, temp_mr),
+                     iter,
+                     iter + num_column_instances,
+                     [column_to_buffer_map = column_to_buffer_map.begin(),
+                      column_info = column_info.begin(),
+                      num_columns,
+                      buffers_per_partition,
+                      partition_row_indices = partition_row_indices.begin(),
+                      dst_offsets = dst_offsets.begin()] __device__ (size_t i){
+      auto const partition_index = i / num_columns;
+      auto const col_index = i % num_columns;
+      auto const& cinfo = column_info[col_index];
+      if(cinfo.has_validity){
+        auto const buf_index = column_to_buffer_map[col_index] + (partition_index * buffers_per_partition);
+        dst_offsets[buf_index] = (partition_row_indices[partition_index] / 32) * sizeof(bitmask_type);
+      }
+    });
   }
 
   // generate batches
@@ -3369,7 +3395,8 @@ std::pair<std::vector<rmm::device_buffer>, rmm::device_uvector<assemble_batch>> 
                                                                                    num_partitions,
                                                                                    src_sizes_unpadded = src_sizes_unpadded.begin(),
                                                                                    src_offsets = src_offsets.begin(),
-                                                                                   desired_batch_size = desired_batch_size] __device__ (size_t src_buf_index, size_t batch_index){
+                                                                                   desired_batch_size = desired_batch_size,
+                                                                                   partition_row_indices = partition_row_indices.begin()] __device__ (size_t src_buf_index, size_t batch_index){
                                          auto const batch_offset = batch_index * desired_batch_size;
                                          auto const partition_index = src_buf_index / buffers_per_partition;
                                          
@@ -3380,16 +3407,17 @@ std::pair<std::vector<rmm::device_buffer>, rmm::device_uvector<assemble_batch>> 
                                          auto const dst_offset = dst_offsets[dst_offset_index];
 
                                          auto const bytes = std::min(src_sizes_unpadded[src_buf_index] - batch_offset, desired_batch_size);
-
-                                         /*                                         
-                                         printf("ET: partition_index=%lu, src_buf_index=%lu, dst_buf_index=%lu, batch_index=%lu, src_offset=%lu, dst_offset=%lu bytes=%lu\n", 
+                                         
+                                         /*
+                                         printf("ET: partition_index=%lu, src_buf_index=%lu, dst_buf_index=%lu, batch_index=%lu, src_offset=%lu, dst_offset=%lu bytes=%lu bit_shift = %d\n", 
                                            partition_index,
                                            src_buf_index,
                                            dst_buf_index,
                                            batch_index,
                                            src_offset + batch_offset,
                                            dst_offset + batch_offset,
-                                           bytes);
+                                           bytes,
+                                           partition_row_indices[partition_index] % 32);
                                            */
 
                                          return assemble_batch {
@@ -3397,7 +3425,7 @@ std::pair<std::vector<rmm::device_buffer>, rmm::device_uvector<assemble_batch>> 
                                           dst_buffers[dst_buf_index] + dst_offset + batch_offset,
                                           bytes,
                                           0,  // TODO: handle offsets
-                                          0,  // TODO: handle validity shifting
+                                          partition_row_indices[partition_index] % 32,  // bit shift for the validity copy step
                                           0};
                                          }),
                                        stream,
@@ -3406,22 +3434,104 @@ std::pair<std::vector<rmm::device_buffer>, rmm::device_uvector<assemble_batch>> 
   return {std::move(assemble_buffers), std::move(copy_batches)};
 }
 
+template<int block_size>
+__global__ void copy_validity(cudf::device_span<assemble_batch> batches)
+{
+  int batch_index = blockIdx.x;
+  auto& batch = batches[batch_index];
+  
+  __shared__ uint32_t next_word[block_size - 1];
+  
+  auto remaining_words = batch.size / sizeof(uint32_t);
+  auto src = reinterpret_cast<bitmask_type const*>(batch.src);
+  auto dst = reinterpret_cast<bitmask_type*>(batch.dst);   // dst starts at the first word corresponding to the row count of the first bit in src
+
+  // eg, for a 3 bit shift:
+  // upper_shift_mask = 0xd0000000
+  // lower_shift_mask = 0x1fffffff
+  auto const upper_shift = 32 - batch.bit_shift;
+  uint32_t const upper_shift_mask = ((1 << batch.bit_shift) - 1) << upper_shift; 
+  auto const lower_shift = batch.bit_shift;
+  uint32_t const lower_shift_mask = ~upper_shift_mask;
+
+  // read the first batch of words
+  auto words_in_batch = min(static_cast<size_t>(block_size), remaining_words);
+  uint32_t word = threadIdx.x < words_in_batch ? src[threadIdx.x] : 0;
+  src += words_in_batch;
+  remaining_words -= words_in_batch;
+
+  // if we have a bit shift, use atomics to write the leading bits into the first word
+  // which overlaps with another copy
+  if(batch.bit_shift > 0){
+    if(threadIdx.x == 0){
+      atomicOr(dst, (word & upper_shift_mask) >> upper_shift);
+    } else {
+      next_word[threadIdx.x - 1] = word;
+    }
+    dst++;
+    __syncthreads();
+  }
+
+  // copy the rest normally
+  do {
+    if(threadIdx.x < words_in_batch - 1){
+      dst[threadIdx.x] = ((word & lower_shift_mask) << lower_shift) |
+                         ((next_word[threadIdx.x] & upper_shift_mask) >> upper_shift);
+    }
+    if(remaining_words == 0){
+      break;
+    }
+
+    // fetch next batch of words
+    words_in_batch = min(static_cast<size_t>(block_size), remaining_words);
+    word = threadIdx.x < words_in_batch ? src[threadIdx.x] : 0;
+    next_word[threadIdx.x - 1] = word;
+    src += words_in_batch;
+    dst += words_in_batch;
+    remaining_words -= words_in_batch;
+    __syncthreads();
+  } while(1);
+  
+  // trailing bits. always write this using atomicOr, even if we have no bit shift because we may not be writing a full
+  // 32 bit word.
+  if(threadIdx.x == words_in_batch - 1){
+    atomicOr(dst + threadIdx.x, (word & lower_shift_mask) << lower_shift);
+  }
+
+  /*
+  if(threadIdx.x == 0){
+    batch.valid_count = valid_count;
+  }
+  */
+}
+
 void assemble_copy(rmm::device_uvector<assemble_batch> const& batches, rmm::cuda_stream_view stream)
 {
-  auto input_iter = thrust::make_transform_iterator(batches.begin(), cuda::proclaim_return_type<void*>([] __device__ (assemble_batch const& batch){
-    return reinterpret_cast<void*>(const_cast<int8_t*>(batch.src));
-  }));
-  auto output_iter = thrust::make_transform_iterator(batches.begin(), cuda::proclaim_return_type<void*>([] __device__ (assemble_batch const& batch){
-    return reinterpret_cast<void*>(batch.dst);
-  }));
-  auto size_iter = thrust::make_transform_iterator(batches.begin(), cuda::proclaim_return_type<size_t>([] __device__ (assemble_batch const& batch){
-    return batch.size;
-  }));
+  // main data copy. everything except validity and offsets
+  {
+    auto input_iter = thrust::make_transform_iterator(batches.begin(), cuda::proclaim_return_type<void*>([] __device__ (assemble_batch const& batch){
+      return reinterpret_cast<void*>(const_cast<int8_t*>(batch.src));
+    }));
+    auto output_iter = thrust::make_transform_iterator(batches.begin(), cuda::proclaim_return_type<void*>([] __device__ (assemble_batch const& batch){
+      return reinterpret_cast<void*>(batch.dst);
+    }));
+    auto size_iter = thrust::make_transform_iterator(batches.begin(), cuda::proclaim_return_type<size_t>([] __device__ (assemble_batch const& batch){
+      // don't do any work for validity
+      return batch.validity ? 0 : batch.size;
+    }));
 
-  size_t temp_storage_bytes;
-  cub::DeviceMemcpy::Batched(nullptr, temp_storage_bytes, input_iter, output_iter, size_iter, batches.size(), stream);
-  rmm::device_buffer temp_storage(temp_storage_bytes, stream, cudf::get_current_device_resource_ref());
-  cub::DeviceMemcpy::Batched(temp_storage.data(), temp_storage_bytes, input_iter, output_iter, size_iter, batches.size(), stream);
+    size_t temp_storage_bytes;
+    cub::DeviceMemcpy::Batched(nullptr, temp_storage_bytes, input_iter, output_iter, size_iter, batches.size(), stream);
+    rmm::device_buffer temp_storage(temp_storage_bytes, stream, cudf::get_current_device_resource_ref());
+    cub::DeviceMemcpy::Batched(temp_storage.data(), temp_storage_bytes, input_iter, output_iter, size_iter, batches.size(), stream);
+  }
+
+  // copy validity
+  /*
+  constexpr int block_size = 256;
+  cudf::detail::grid_1d const grid{static_cast<cudf::thread_index_type>(batches.size()), block_size};
+  copy_validity<block_size><<<grid.num_blocks, grid.num_threads_per_block, 0, stream.value()>>>(batches);
+  */
 
   stream.synchronize();
 }

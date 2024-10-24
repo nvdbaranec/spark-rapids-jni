@@ -39,6 +39,8 @@ struct shuffle_split_metadata {
   std::vector<shuffle_split_col_data> col_info;
 };
 
+// for an empty result (a table with no rows), 
+// shuffle_split_result::partitions and shuffle_split_result::offsets will both be empty.
 struct shuffle_split_result {
   // packed partition buffers.
   // - it is one big buffer where all of the partitions are glued together instead
@@ -53,10 +55,14 @@ struct shuffle_split_result {
   //       included, rounded up the nearest bitmask_type number of elements
   //   - pad to partition_data_align bytes
   //   - the contiguous-split style buffer of column data (which is also padded to partition_data_align bytes)
+  //
+  // Will be size 0 for an empty (0 rows) table result.
   std::unique_ptr<rmm::device_buffer>   partitions{};
 
   // offsets into the partition buffer for each partition. offsets.size() will be
   // num partitions
+  //
+  // Will be size 0 for an empty (0 rows) table result.
   rmm::device_uvector<size_t>           offsets{0, cudf::get_default_stream()};
 };
 
