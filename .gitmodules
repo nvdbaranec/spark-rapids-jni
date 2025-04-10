@@ -1,4 +1,4 @@
 [submodule "thirdparty/cudf"]
 	path = thirdparty/cudf
-	url = https://github.com/rapidsai/cudf.git
-	branch = branch-25.06
+	url = https://github.com/nvdbaranec/cudf.git
+	branch = snap_test1_cudf
